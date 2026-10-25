@@ -1,10 +1,14 @@
 # VibeMail Engine — Build Contract
 
-Status: **Draft v2** · Owner: Terry Kim · Date: 2026-10-25
+Status: **Draft v4** · Owner: Terry Kim · Date: 2026-10-25
 
-This document is the single source of truth for the VibeMail engine build. Anything not specified here is out of scope. Changes require an amendment to this file, merged before the code that depends on them. The ordered build units and their verification checks live in [build_sequence.md](docs/build_sequence.md). §6 binds them to this contract.
+This document is the single source of truth for the VibeMail engine build. Anything not specified here is out of scope. Changes require an amendment to this file, merged before the code that depends on them. The ordered build units and their verification checks live in [build_sequence.md](build_sequence.md). §6 binds them to this contract.
 
 **v2 amendments:** Pub/Sub push sync added (§2.5, §2.6, §4.2). Hosting moved to Vercel Functions (§0). Integration tests run against live Supabase (§1). Provider abstraction added (§5.1). Schema now ships with the unit that first needs it, replacing the server-first two-session rule (§6).
+
+**v3 amendments:** The contract now matches the repo's tooling. No HTTP framework: each route is a Vercel function file under `api/` (§0, §2 routing table). Tests use Jest + ts-jest + supertest instead of Vitest + msw (§0, AC-3). The Pub/Sub topic env var is `GOOGLE_PUBSUB_TOPIC`, and `FRONTEND_URL` is a recognized variable (AC-4). Module paths follow the scaffold (`src/providers`, `src/db`). `src/providers/imap` is reserved for a future provider (§5.1, §7).
+
+**v4 amendments:** The build is two sessions again: server logic on `main` and schema on a `schema` branch. The schema branch merges only after `npm test` exits 0 on `main` (§6, AC-19). The Pub/Sub webhook is served at `/webhook/gmail` through a `vercel.ts` rewrite (§2 routing). §2 now lists which routes skip JWT auth and what authenticates each one instead.
 
 ---
 
@@ -13,7 +17,7 @@ This document is the single source of truth for the VibeMail engine build. Anyth
 | Area | Decision |
 |---|---|
 | Language / runtime | TypeScript (strict), Node.js 24 LTS |
-| HTTP framework | Hono app, exported as the handler for Vercel Functions |
+| HTTP framework | None. Each route is a Vercel function file under `api/` (file-based routing). Shared logic lives in `src/`, and `api/` files stay thin |
 | Hosting | Vercel Functions, Node.js runtime with Fluid Compute. Local preview: `vercel dev` |
 | Store | PostgreSQL on Supabase, accessed only through repository interfaces (§5.2) |
 | Mail provider | Accessed only through the `MailProvider` interface (§5.1). Gmail is the sole implementation |
@@ -23,8 +27,8 @@ This document is the single source of truth for the VibeMail engine build. Anyth
 | Sync model | On link, an initial sync stores the 50 most recent messages. After that, Gmail Pub/Sub push notifications drive incremental sync through `users.history.list` |
 | List source of truth | Gmail, live on every call; results upserted into the store before responding (unchanged from v1) |
 | Error format | Custom envelope with a closed code union (§3) |
-| Tests | Vitest. Unit tests: Gmail mocked with `msw` and the store mocked with in-memory fakes. Integration tests: live Supabase, with Gmail still mocked |
-| Build | Seven units in order, per build_sequence.md (§6) |
+| Tests | Jest with ts-jest; route tests use supertest. Unit tests (`tests/unit`): the `googleapis` client mocked via `jest.mock` with recorded JSON fixtures, and the store faked in memory. Integration tests (`tests/integration`): live Supabase, with Gmail still mocked |
+| Build | Two sessions: server logic on `main` (units 1–7, per build_sequence.md) and schema on the `schema` branch. Schema merges only after server tests pass (§6) |
 
 ---
 
@@ -35,10 +39,10 @@ The project is **complete** when every item below is true. Each is verifiable by
 ### Build and quality
 - **AC-1** `npm run typecheck` (`tsc --noEmit`, `strict: true`) exits 0.
 - **AC-2** `npm run lint` exits 0.
-- **AC-3** `npm run test:unit` exits 0 with no skipped or `.only` tests and no real outbound network calls (`msw` configured with `onUnhandledRequest: "error"`).
-- **AC-4** No secret is committed. All configuration is read from env vars listed in `.env.example`: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `JWT_SECRET`, `JWT_TTL_SECONDS`, `TOKEN_ENCRYPTION_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `GMAIL_PUBSUB_TOPIC`, `PUBSUB_PUSH_AUDIENCE`, `PUBSUB_PUSH_SERVICE_ACCOUNT`, `CRON_SECRET`.
+- **AC-3** `npm run test:unit` exits 0 with no skipped or `.only` tests and no real outbound network calls (`googleapis` is mocked in a Jest setup file, and any unmocked Gmail method throws).
+- **AC-4** No secret is committed. All configuration is read from env vars listed in `.env.example`: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI`, `JWT_SECRET`, `JWT_TTL_SECONDS`, `TOKEN_ENCRYPTION_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `GOOGLE_PUBSUB_TOPIC`, `PUBSUB_PUSH_AUDIENCE`, `PUBSUB_PUSH_SERVICE_ACCOUNT`, `CRON_SECRET`, `FRONTEND_URL`. `FRONTEND_URL` is kept for the frontend; no contract behavior depends on it yet.
 
-### Endpoint behavior (each has at least one passing route-level test)
+### Endpoint behavior (each has at least one passing route-level supertest test)
 - **AC-5** OAuth callback exchanges a valid `code`, creates or updates the account, stores the refresh token encrypted, starts a Gmail watch, and returns a JWT that authenticates the core endpoints.
 - **AC-6** Every error case listed in §2 for every endpoint has a test that asserts **both** the HTTP status **and** the `error.code`.
 - **AC-7** Message list returns messages in Gmail order and supports `limit`, `pageToken`, `q`, and `unread`. Afterward, every returned message is in the store with fields matching §4.
@@ -57,17 +61,51 @@ The project is **complete** when every item below is true. Each is verifiable by
 - **AC-16** Supabase migrations create exactly the tables and columns in §4. The Supabase repositories pass the **same** repository contract suite that the in-memory fakes pass.
 
 ### Deployment and integration
-- **AC-17** Under `vercel dev`, the four core endpoints, plus `GET /auth/google`, `POST /webhooks/gmail` and `GET /cron/renew-watch`, respond with the statuses and shapes in §2.
+- **AC-17** Under `vercel dev`, the four core endpoints, plus `GET /api/v1/auth/google`, `POST /webhook/gmail` and `GET /api/cron/renew-watch`, respond at the deployed paths in the §2 routing table with the statuses and shapes in §2.
 - **AC-18** `npm run test:integration` exits 0 with no skipped tests against a live Supabase instance (local `supabase start` or a dedicated test project, never production), with migrations applied fresh. Gmail stays mocked.
 
 ### Process
-- **AC-19** Every unit in build_sequence.md was verified before the next unit started (§6).
+- **AC-19** The sequencing rule in §6 was followed. The `schema` branch merge post-dates a run of `npm test` on `main` that exited 0. The schema session wrote nothing outside `supabase/migrations/` and `src/types/`. Every server unit was verified before the next one started.
 
 ---
 
 ## 2. API endpoint contracts
 
-All endpoints return `application/json`. Core endpoints that need auth require `Authorization: Bearer <jwt>`. Field types are TypeScript.
+All endpoints return `application/json`. Field types are TypeScript.
+
+### Authentication
+
+Every client endpoint requires `Authorization: Bearer <jwt>` (the engine JWT), except the four routes below. Each of those is authenticated some other way, or not at all.
+
+| Route | JWT? | Authenticated by |
+|---|---|---|
+| `GET /api/v1/messages` | **required** | engine JWT |
+| `POST /api/v1/messages/send` | **required** | engine JWT |
+| `PATCH /api/v1/messages/:id` | **required** | engine JWT |
+| `GET /api/v1/auth/google/callback` | skipped | the signed, expiring `state` parameter (§2.1) |
+| `GET /api/v1/auth/google` | skipped | nothing. It's the entry point of login, before the user has a JWT, and it only issues a redirect with a fresh signed `state` |
+| `POST /webhook/gmail` | skipped | Google-signed Pub/Sub OIDC token, checked against `PUBSUB_PUSH_AUDIENCE` and `PUBSUB_PUSH_SERVICE_ACCOUNT` (§2.5) |
+| `GET /api/cron/renew-watch` | skipped | `Authorization: Bearer <CRON_SECRET>` (§2.6) |
+
+A route not in this table needs a contract amendment before it's added. Any new client route defaults to requiring the JWT.
+
+### Routing
+
+Section headings below use the short path. The deployed path is set by the function file's location under `api/`. Each file default-exports a Node handler `(req: VercelRequest, res: VercelResponse)` from `@vercel/node`. Route tests mount that handler on `http.createServer` for supertest.
+
+| Short path (§) | Deployed path | Function file |
+|---|---|---|
+| `GET /auth/google` (§2.1) | `GET /api/v1/auth/google` | `api/v1/auth/google/index.ts` |
+| `GET /auth/google/callback` (§2.1) | `GET /api/v1/auth/google/callback` | `api/v1/auth/google/callback.ts` |
+| `GET /messages` (§2.2) | `GET /api/v1/messages` | `api/v1/messages/index.ts` |
+| `POST /messages/send` (§2.3) | `POST /api/v1/messages/send` | `api/v1/messages/send.ts` |
+| `PATCH /messages/:id` (§2.4) | `PATCH /api/v1/messages/:id` | `api/v1/messages/[id].ts` |
+| `POST /webhook/gmail` (§2.5) | `POST /webhook/gmail` | `api/webhook/gmail.ts`, served through a `vercel.ts` rewrite |
+| `GET /cron/renew-watch` (§2.6) | `GET /api/cron/renew-watch` | `api/cron/renew-watch.ts` |
+
+Vercel matches static files before dynamic ones, so `send.ts` wins over `[id].ts` for `/send`. Each handler rejects any other method with `405` and an `Allow` header. `GOOGLE_REDIRECT_URI` must point to the deployed callback path.
+
+**Webhook rewrite.** The webhook sits outside `/api/v1` and outside Vercel's default `/api` prefix, so `vercel.ts` declares `rewrites: [routes.rewrite('/webhook/gmail', '/api/webhook/gmail')]`. The Pub/Sub push subscription's endpoint is `https://<host>/webhook/gmail`, and that same URL is the `PUBSUB_PUSH_AUDIENCE`. The rewrite target `/api/webhook/gmail` stays reachable, but it's an implementation detail: no client, test or subscription may use it.
 
 ### Shared types
 
@@ -153,7 +191,7 @@ interface OAuthCallbackQuery {
 3. Verify the `id_token`; take `sub` and `email`.
 4. Confirm the granted scopes include `gmail.modify`.
 5. Upsert the account by `google_sub`. Store the refresh token encrypted. If Google returned no refresh token and the account has none stored, fail.
-6. Call `users.watch` with `{ topicName: GMAIL_PUBSUB_TOPIC, labelIds: ["INBOX"], labelFilterBehavior: "include" }`. Store `history_id` and `watch_expiration` from the response, and set `sync_status = "pending"`. A watch failure fails the request with `502 GMAIL_WATCH_FAILED`.
+6. Call `users.watch` with `{ topicName: GOOGLE_PUBSUB_TOPIC, labelIds: ["INBOX"], labelFilterBehavior: "include" }`. Store `history_id` and `watch_expiration` from the response, and set `sync_status = "pending"`. A watch failure fails the request with `502 GMAIL_WATCH_FAILED`.
 7. Schedule the initial sync (§2.7) with `waitUntil` from `@vercel/functions`, and respond without waiting for it.
 8. Issue JWT: HS256, `sub = account.id`, `iat`, `exp = iat + JWT_TTL_SECONDS` (default 86400).
 
@@ -312,9 +350,9 @@ If Gmail succeeds but the store fails, the response is `503`. A client retry is 
 
 ### 2.5 Pub/Sub webhook receiver (supporting)
 
-`POST /webhooks/gmail`
+`POST /webhook/gmail` (rewritten to `api/webhook/gmail.ts`)
 
-Called by a Cloud Pub/Sub **push** subscription on `GMAIL_PUBSUB_TOPIC`. This endpoint doesn't use the engine JWT.
+Called by a Cloud Pub/Sub **push** subscription on `GOOGLE_PUBSUB_TOPIC`. This endpoint doesn't use the engine JWT.
 
 **Auth:** `Authorization: Bearer <Google-signed OIDC token>`. The engine verifies the signature against Google's certs, checks that `aud` equals `PUBSUB_PUSH_AUDIENCE`, and requires `email_verified` with `email` equal to `PUBSUB_PUSH_SERVICE_ACCOUNT`.
 
@@ -486,7 +524,7 @@ Supabase notes: tables live in `public` with RLS **enabled and no policies**. Th
 
 ### 5.1 Provider abstraction (unit 1)
 
-All mail operations go through this interface, defined in `src/provider/types.ts`. `GmailProvider` is the only implementation. Routes and sync code import only the interface.
+All mail operations go through this interface, defined in `src/providers/types.ts`. `GmailProvider` (`src/providers/gmail/`) is the only implementation in scope. `src/providers/imap/` is reserved for a future provider and must implement the same interface without changes to it. Routes and sync code import only the interface.
 
 ```ts
 interface ProviderTokens {
@@ -532,7 +570,7 @@ Every method throws a typed `ProviderError` whose `code` is one of the `GMAIL_*`
 
 ### 5.2 Repositories
 
-Defined in `src/store/types.ts`, with in-memory fakes and a shared contract suite (`src/store/repository.contract.ts`) that runs against both the fakes and Supabase.
+Defined in `src/db/types.ts`, with in-memory fakes and a shared contract suite (`tests/shared/repository.contract.ts`) that runs against both the fakes and Supabase.
 
 ```ts
 interface AccountRepository {
@@ -566,28 +604,59 @@ interface MessageRepository {
 
 ## 6. Build sequence and gates
 
-The build follows the seven units in [build_sequence.md](docs/build_sequence.md), strictly in order. A unit is **verified** when its check passes **and** the acceptance criteria tied to it below pass. The next unit doesn't start until then.
+The build runs in **two sessions**.
 
-Schema ships with the unit that first needs it, not after the server. *This replaces v1's rule that server logic ships and passes tests before the schema is reviewed or merged.*
+**Sequencing rule: the schema session can't be merged until the server logic tests pass.** *This replaces v2/v3's rule that each migration ships with the unit that first needs it.*
 
-| # | Unit | Verification (from build_sequence.md) | Contract scope | ACs | Migration shipped |
-|---|---|---|---|---|---|
-| 1 | Provider abstraction interface | TypeScript compiles clean and the interface defines all required methods | §5.1 `MailProvider`, §5.2 interfaces + fakes, §3 error union | AC-1, AC-2 | — |
-| 2 | Gmail OAuth layer with token persistence listener | OAuth flow completes, tokens are stored in Supabase, and refresh works without a token mismatch | §2.1 steps 1–5 and 8, `GET /auth/google`, token listener (§5.1) | AC-5 (minus watch), AC-10, AC-11 | `0001_accounts.sql`: §4.2 columns `id` … `scopes`, `created_at`, `updated_at` |
-| 3 | Sync and read layer | Initial sync fetches 50 messages, and message objects match the contract data model exactly | §2.1 step 7, §2.7, §2.2, body extraction | AC-7, AC-12, AC-15 | `0002_messages.sql`: all of §4.1, plus §4.2 `sync_status`, `last_synced_at` |
-| 4 | Pub/Sub webhook receiver | The webhook receives a notification and fetches the correct delta via history ID | §2.1 step 6, §2.5, §2.6 | AC-13, AC-14 | `0003_sync_cursor.sql`: §4.2 `history_id`, `watch_expiration`; unique index on `email` |
-| 5 | Send layer | A message sends successfully via the Gmail API on behalf of an authenticated user | §2.3, §2.4 | AC-8, AC-9 | — |
-| 6 | Vercel API function entry points | All four endpoints respond correctly in local preview | Hono app exported for Vercel, `vercel.ts` (cron), all routes in §2 | AC-17 | — |
-| 7 | Integration tests | The full test suite passes with no skipped tests against a live Supabase instance | Full suite, repository contract suite against Supabase | AC-3, AC-6, AC-16, AC-18 | — |
+### Sessions
+
+| Session | Branch | Owns (may write) | Must not write |
+|---|---|---|---|
+| Server logic | `main` | `src/` (except `src/types/`), `api/`, `tests/`, `vercel.ts`, `package.json` | `supabase/migrations/`, `src/types/` |
+| Schema | `schema` | `supabase/migrations/`, `src/types/` | `src/db/`, the rest of `src/`, `api/`, `tests/` |
+
+- **Server session:** builds units 1–7 from [build_sequence.md](build_sequence.md) in order. Repositories are typed against the §4 row types in `src/db/types.ts`. Until the schema merges, the server session runs on the in-memory fakes.
+- **Schema session:** writes the migrations for all of §4, plus the generated Supabase `Database` type (`supabase gen types typescript`) in `src/types/database.ts`. It may branch and draft at any time.
+
+### Server units
+
+A unit is **verified** when its check passes **and** the acceptance criteria tied to it pass. The next unit doesn't start until then. Units 1–6 are verified against fakes and mocked Gmail. Unit 7 is the first unit that needs the merged schema.
+
+| # | Unit | Verification (from build_sequence.md) | Contract scope | ACs |
+|---|---|---|---|---|
+| 1 | Provider abstraction interface | TypeScript compiles clean and the interface defines all required methods | §5.1 `MailProvider`, §5.2 interfaces + fakes, §3 error union | AC-1, AC-2 |
+| 2 | Gmail OAuth layer with token persistence listener | OAuth flow completes, tokens are stored in Supabase, and refresh works without a token mismatch | §2.1 steps 1–5 and 8, `GET /auth/google`, token listener (§5.1) | AC-5 (minus watch), AC-10, AC-11 |
+| 3 | Sync and read layer | Initial sync fetches 50 messages, and message objects match the contract data model exactly | §2.1 step 7, §2.7, §2.2, body extraction | AC-7, AC-12, AC-15 |
+| 4 | Pub/Sub webhook receiver | The webhook receives a notification and fetches the correct delta via history ID | §2.1 step 6, §2.5, §2.6 | AC-13, AC-14 |
+| 5 | Send layer | A message sends successfully via the Gmail API on behalf of an authenticated user | §2.3, §2.4 | AC-8, AC-9 |
+| 6 | Vercel API function entry points | All four endpoints respond correctly in local preview | Function files per the §2 routing table, `vercel.ts` (cron + webhook rewrite), all routes in §2 | AC-17 |
+| 7 | Integration tests | The full test suite passes with no skipped tests against a live Supabase instance | Supabase repositories in `src/db/` (importing `src/types/database.ts`), repository contract suite against Supabase, full suite | AC-3, AC-6, AC-16, AC-18 |
+
+### Schema deliverables
+
+| Migration | Contents |
+|---|---|
+| `supabase/migrations/0001_accounts.sql` | §4.2 columns `id` … `scopes`, `created_at`, `updated_at` |
+| `supabase/migrations/0002_messages.sql` | all of §4.1, plus §4.2 `sync_status`, `last_synced_at` |
+| `supabase/migrations/0003_sync_cursor.sql` | §4.2 `history_id`, `watch_expiration`; unique index on `email` |
+| `src/types/database.ts` | generated from the three migrations above; never hand-edited |
+
+### Gates (enforced in order)
+
+1. **G1, server green.** `npm test` exits 0 on `main` with units 1–6 merged. CI records the run.
+2. **G2, schema review.** The `schema` PR is reviewed only after G1. Its description links the G1 run.
+3. **G3, schema merge.** The `schema` branch merges into `main` only after G1, and only if `npm test` still exits 0 on the merge result. A schema merge before G1 violates the contract and must be reverted.
+4. **G4, unit 7.** The server session starts unit 7 only after G3.
 
 ### Gate rules
-1. **Live checks.** Units 2, 4 and 5 are verified once against a real Google test account and the dev Supabase project, plus automated tests with mocked Gmail. The live run is recorded (date, account, result) in the unit's PR description.
-2. **Migrations are additive.** Each migration is a new file. No unit edits a migration that an earlier unit shipped. A schema change after merge gets a new numbered migration and a contract amendment.
-3. **One unit per PR.** Each PR's description states the unit number, the verification result, and the ACs it satisfies. A PR for unit *n* isn't reviewed until unit *n − 1* is merged.
-4. **Contract first.** If a unit needs a change to §2–§5, amend this file in its own PR, merged before the unit's PR.
+
+1. **Live checks.** The unit 2, 4 and 5 checks that need real storage ("tokens stored in Supabase" and the webhook delta) are run after G3, as part of unit 7, against a real Google test account and the dev Supabase project. Before then, those units are verified with automated tests against fakes. Each live run is recorded (date, account, result) in the unit 7 PR description.
+2. **Migrations are additive.** Once a migration is merged, it's never edited. A later schema change is a new numbered migration from the schema session, plus a contract amendment.
+3. **One unit per PR on `main`.** Each PR's description states the unit number, the verification result, and the ACs it satisfies. A PR for unit *n* isn't reviewed until unit *n − 1* is merged.
+4. **Contract first.** If either session needs a change to §2–§5, amend this file in its own PR, merged before the PR that depends on it.
 
 ---
 
 ## 7. Out of scope
 
-Attachment download or upload, drafts, labels other than `UNREAD` and `INBOX` (watch filter), Pub/Sub pull subscriptions, multiple Gmail accounts per user, JWT refresh endpoint, frontend, and production deployment and promotion (only local `vercel dev` preview is required).
+Attachment download or upload, drafts, labels other than `UNREAD` and `INBOX` (watch filter), Pub/Sub pull subscriptions, an IMAP provider implementation, multiple Gmail accounts per user, JWT refresh endpoint, frontend, and production deployment and promotion (only local `vercel dev` preview is required).
